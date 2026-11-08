@@ -132,15 +132,91 @@ python -m relay.server --port 8080
 python scripts/smoke_test.py --url http://localhost:8080 --token demo-token
 <paste output here>
 ```
+[1] Seed workflows loaded and published
+  PASS  GET /workflows returns 200  (got 200)
+  PASS  seed wf_support_triage present
+  PASS  seed wf_expense_approval present
+  PASS  seed wf_slow_fulfillment present
+  PASS  seed wf_runaway present
+  PASS  seeds are published  (expected status 'published' on seed workflows)
+
+[2] Create, publish, trigger a minimal workflow
+  PASS  create draft returns 2xx  (got 201)
+  PASS  publish returns 2xx  (got 200)
+  PASS  trigger returns a run id  (got 202: {'run_id': 'run_fade13e0380d', 'id': 'run_fade13e0380d', 'status': 'queued'})
+  PASS  run reaches succeeded  (got succeeded)
+  PASS  trace has a step for node 'hello'  (1 steps)
+  PASS  notify step visible in mock world ledger
+  PASS  notify carried an Idempotency-Key  (required for exactly-once recovery)
+
+[3] Publish validation rejects broken definitions
+  PASS  rejects unknown node type (at publish)  (got 422)
+  PASS  rejects missing required param (at publish)  (got 422)
+  PASS  rejects reference to nonexistent node (at publish)  (got 422)
+
+[4] Webhook secret enforcement
+  PASS  wrong secret rejected 401/403  (got 401)
+  PASS  correct secret accepted with a run id  (got 202)
+
+[5] Approval lifecycle (wf_expense_approval)
+  PASS  small expense auto-approves (no gate)  (got succeeded)
+  PASS  large expense triggered  (got 202)
+  PASS  run pauses in waiting_approval  (got waiting_approval)
+  PASS  pending approval listed for the run  (1 pending)
+  PASS  approve returns 2xx  (got 200)
+  PASS  approved run resumes and succeeds  (got succeeded)
+
+[6] Run caps stop wf_runaway
+  PASS  wf_runaway triggered  (got 202)
+  PASS  runaway run is stopped (failed/cancelled)  (got failed)
+  PASS  stop reason mentions the cap  (expected a cap-exceeded reason in the run record)
+
+[7] Status vocabulary
+  PASS  all observed statuses in documented set  (saw ['failed', 'running', 'succeeded', 'waiting_approval'])
+
+========================================================
+  28 passed, 0 warnings, 0 failed
+'''
 
 **B2. Live kill-and-resume** (stop the worker, then):
 ```
 PYTHON=python bash scripts/kill_resume_drill.sh
 <paste output here>
+$ PYTHON=python bash scripts/kill_resume_drill.sh
+== 1. start worker A
+== 2. trigger wf_slow_fulfillment
+   run_id = run_d37be0ceb0d7
+== 3. wait until the run is inside the 20s delay (confirm email already sent)
+('running', 'pack_delay', [('confirm', 'succeeded')])
+== 4. kill -9 worker A mid-delay
+scripts/kill_resume_drill.sh: line 37:  1767 Killed                     "$PY" -m relay.worker > /tmp/relay_worker_a.log 2>&1
+('after kill:', 'running', 'current =', 'pack_delay')
+== 5. start worker B (the lease expires, B resumes from the last persisted step)
+final status: succeeded
+   1 confirm          succeeded  key=run_d37be0ceb0d7:confirm
+   2 pack_delay       succeeded  key=None
+   3 create_shipment  succeeded  key=run_d37be0ceb0d7:create_shipment
+   4 shipped_notice   succeeded  key=run_d37be0ceb0d7:shipped_notice
+== 6. mock world ledger (each side effect must appear exactly once)
+   order.refund     key=run_d883f3fb985c:issue_refund
+   email.send       key=run_d883f3fb985c:notify_customer
+   email.send       key=run_4d4d2d4c4b05:confirm
+   shipment.create  key=run_4d4d2d4c4b05:create_shipment
+   email.send       key=run_d37be0ceb0d7:confirm
+   shipment.create  key=run_d37be0ceb0d7:create_shipment
+   email.send       key=run_d37be0ceb0d7:shipped_notice
+   total side effects: 7
+== done (expected: 3 side effects: email confirm, shipment, email shipped)
 ```
 
 **B3. Duplication check**
 ```
 python scripts/duplication_check.py
 <paste output here>
+Ledger entries checked: 7 (executed: 6, replays absorbed: 0, rejected: 1)
+  email.send: 4 executed
+  order.refund: 1 executed
+  shipment.create: 1 executed
+
+PASS: every side effect executed exactly once.
 ```
