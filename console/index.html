@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relay console</title>
+<style>
+  :root { --bg:#f6f7fb; --card:#fff; --ink:#1c2230; --muted:#68728a; --line:#e3e6ef; --accent:#4f46e5;
+          --ok:#15803d; --bad:#b91c1c; --warn:#b45309; --info:#1d4ed8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151d; --card:#1a1f2b; --ink:#e8ebf3; --muted:#97a0b5; --line:#2a3142; --accent:#818cf8;
+            --ok:#4ade80; --bad:#f87171; --warn:#fbbf24; --info:#60a5fa; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; gap:16px; align-items:center; padding:12px 20px; background:var(--card); border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; } header .grow { flex:1; }
+  nav button { background:none; border:0; padding:8px 12px; font:inherit; color:var(--muted); cursor:pointer; border-bottom:2px solid transparent; }
+  nav button.on { color:var(--ink); border-color:var(--accent); font-weight:600; }
+  main { max-width:1100px; margin:20px auto; padding:0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:12px; }
+  table { width:100%; border-collapse:collapse; } th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }
+  .pill { display:inline-block; padding:1px 9px; border-radius:99px; font-size:12px; font-weight:600; border:1px solid currentColor; }
+  .succeeded,.published,.approved { color:var(--ok); } .failed,.rejected { color:var(--bad); }
+  .running,.queued { color:var(--info); } .waiting_approval,.waiting,.pending,.draft { color:var(--warn); } .cancelled { color:var(--muted); }
+  button.act { font:inherit; padding:5px 12px; border-radius:7px; border:1px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; margin-right:6px; }
+  button.act.primary { background:var(--accent); border-color:var(--accent); color:#fff; } button.act.danger { color:var(--bad); }
+  input, textarea { font:inherit; background:var(--bg); color:var(--ink); border:1px solid var(--line); border-radius:7px; padding:6px 9px; }
+  textarea { width:100%; font-family:ui-monospace, Menlo, Consolas, monospace; font-size:12px; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:7px; padding:8px; margin:4px 0 0; overflow:auto; max-height:220px; font-size:12px; }
+  .muted { color:var(--muted); } .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; } a.link { color:var(--accent); cursor:pointer; }
+  .step { border-left:3px solid var(--line); padding:4px 0 4px 12px; margin:10px 0; } details summary { cursor:pointer; color:var(--muted); }
+  #toast { position:fixed; bottom:16px; right:16px; background:var(--ink); color:var(--bg); padding:9px 14px; border-radius:8px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Relay</h1>
+  <nav id="nav"></nav>
+  <span class="grow"></span>
+  <label class="muted">token <input id="token" size="14" value="demo-token"></label>
+  <span class="muted" id="tick"></span>
+</header>
+<main id="view"></main>
+<div id="toast"></div>
+<script>
+const TABS = ["workflows", "runs", "approvals"];
+let tab = "workflows", openRun = null, timer = null;
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+const pill = (s) => `<span class="pill ${esc(s)}">${esc(s)}</span>`;
+const json = (v) => `<pre>${esc(JSON.stringify(v, null, 2))}</pre>`;
+
+async function api(method, path, body) {
+  const res = await fetch(path, { method, headers: { "Authorization": "Bearer " + $("#token").value, "Content-Type": "application/json" },
+                                  body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ? data.error.message : "HTTP " + res.status);
+  return data;
+}
+function toast(msg) { const t = $("#toast"); t.textContent = msg; t.style.display = "block"; setTimeout(() => t.style.display = "none", 3500); }
+async function act(fn) { try { await fn(); } catch (e) { toast(e.message); } render(); }
+
+function nav() {
+  $("#nav").innerHTML = TABS.map(t => `<button class="${t === tab ? "on" : ""}" onclick="go('${t}')">${t}</button>`).join("");
+}
+function go(t) { tab = t; openRun = null; render(); }
+function showRun(id) { tab = "runs"; openRun = id; render(); }
+
+async function renderWorkflows() {
+  const rows = await api("GET", "/workflows");
+  $("#view").innerHTML = `<div class="card"><table><tr><th>Workflow</th><th>Trigger</th><th>Status</th><th>Manual run (input JSON)</th></tr>` +
+    rows.map(w => `<tr><td><b>${esc(w.name)}</b><div class="muted">${esc(w.id)}</div></td><td>${esc(w.trigger_type)}</td><td>${pill(w.status)}</td>
+      <td>${w.status === "published" ? `<div class="row"><input id="in_${esc(w.id)}" size="34" value='{}'>
+        <button class="act primary" onclick="trigger('${esc(w.id)}')">Run</button></div>` : `<button class="act" onclick="publish('${esc(w.id)}')">Publish</button>`}</td></tr>`).join("") +
+    `</table></div><p class="muted">Webhook workflows can also be started from outside with POST /hooks/{id} + X-Relay-Secret.
+    Tip: wf_expense_approval input: {"employee_email":"a@b.com","amount_usd":250,"description":"Ticket"}</p>`;
+}
+function trigger(id) {
+  act(async () => {
+    const r = await api("POST", `/workflows/${id}/trigger`, { input: JSON.parse($("#in_" + id).value || "{}") });
+    toast("Started " + r.run_id); showRun(r.run_id);
+  });
+}
+function publish(id) { act(() => api("POST", `/workflows/${id}/publish`)); }
+
+async function renderRuns() {
+  if (openRun) return renderRun(openRun);
+  const rows = await api("GET", "/runs");
+  $("#view").innerHTML = `<div class="card"><table><tr><th>Run</th><th>Workflow</th><th>Status</th><th>Steps</th><th>Tokens</th><th>Started</th></tr>` +
+    rows.map(r => `<tr><td><a class="link" onclick="showRun('${esc(r.run_id)}')">${esc(r.run_id)}</a></td><td>${esc(r.workflow_id)}</td><td>${pill(r.status)}</td>
+      <td>${r.steps_executed}</td><td>${r.ai_tokens_used || ""}</td><td class="muted">${esc(r.started_at)}</td></tr>`).join("") + `</table></div>`;
+}
+async function renderRun(id) {
+  const r = await api("GET", `/runs/${id}`);
+  const cancellable = !["succeeded", "failed", "cancelled"].includes(r.status);
+  $("#view").innerHTML = `<p><a class="link" onclick="go('runs')">&larr; all runs</a></p>
+    <div class="card"><div class="row"><b>${esc(r.run_id)}</b> ${pill(r.status)} <span class="muted">${esc(r.workflow_id)} &middot; ${r.steps_executed} steps &middot; ${r.ai_tokens_used} AI tokens</span>
+      <span class="grow"></span>${cancellable ? `<button class="act danger" onclick="cancelRun('${esc(r.run_id)}')">Cancel run</button>` : ""}</div>
+      ${r.error ? `<p style="color:var(--bad)"><b>${esc(r.error.code)}</b>: ${esc(r.error.message)}</p>` : ""}
+      ${r.ended_by ? `<p class="muted">ended by: ${esc(r.ended_by)}</p>` : ""}
+      <details><summary>trigger input</summary>${json(r.input)}</details></div>
+    <div class="card"><b>Trace</b>` + r.steps.map(s => `<div class="step"><div class="row"><b>#${s.sequence} ${esc(s.node_id)}</b> <span class="muted">${esc(s.type)}</span>
+        ${pill(s.status)} <span class="muted">attempt ${s.attempt} &middot; ${s.duration_ms ?? "?"} ms${s.tokens ? ` &middot; tokens ${s.tokens.prompt}+${s.tokens.completion}` : ""}</span></div>
+        ${s.idempotency_key ? `<div class="muted">idempotency key: ${esc(s.idempotency_key)}</div>` : ""}
+        ${s.error ? `<div style="color:var(--bad)">${esc(s.error.code)}: ${esc(s.error.message)}</div>` : ""}
+        <details><summary>resolved input / output</summary>${json(s.input)}${json(s.output)}</details></div>`).join("") +
+      (r.steps.length ? "" : `<p class="muted">no steps yet</p>`) + `</div>`;
+}
+function cancelRun(id) { act(() => api("POST", `/runs/${id}/cancel`)); }
+
+async function renderApprovals() {
+  const rows = await api("GET", "/approvals");
+  $("#view").innerHTML = `<div class="card"><table><tr><th>Approval</th><th>Message</th><th>Status</th><th></th></tr>` +
+    rows.map(a => `<tr><td>${esc(a.id)}<div><a class="link" onclick="showRun('${esc(a.run_id)}')">${esc(a.run_id)}</a></div></td><td>${esc(a.message)}</td>
+      <td>${pill(a.status)}<div class="muted">${esc(a.decided_by || "")}</div></td>
+      <td>${a.status === "pending" ? `<button class="act primary" onclick="decide('${esc(a.id)}','approve')">Approve</button>
+        <button class="act danger" onclick="decide('${esc(a.id)}','reject')">Reject</button>` : ""}</td></tr>`).join("") +
+    (rows.length ? "" : `<tr><td colspan="4" class="muted">nothing to approve</td></tr>`) + `</table></div>`;
+}
+function decide(id, verb) { act(() => api("POST", `/approvals/${id}/${verb}`, {})); }
+
+async function render() {
+  nav();
+  try {
+    await ({ workflows: renderWorkflows, runs: renderRuns, approvals: renderApprovals }[tab])();
+    $("#tick").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) { $("#view").innerHTML = `<div class="card" style="color:var(--bad)">${esc(e.message)}<div class="muted">Check the token field above.</div></div>`; }
+}
+render();
+timer = setInterval(() => { if (tab !== "workflows" && !document.activeElement.matches("input")) render(); }, 2000);
+</script>
+</body>
+</html>

@@ -1,99 +1,176 @@
-# Relay Capstone Pack
+# Relay: AI Workflow Orchestrator
 
-This repository contains a self-contained capstone package for building **Relay**, an AI-first workflow orchestrator with durable execution, human approval gates, and AI decision nodes. The AI-first core is the `ai` node: schema-validated model decisions inside runs, with prompt-injection payloads to prove the guardrails hold. Everything else is the engineering that makes that safe: crash recovery, exactly-once side effects, and approval gates the model cannot talk its way past. The flagship Good To Have adds a compiler that turns plain-English descriptions into valid workflow definitions.
+Relay runs workflows made of typed nodes (`http_request`, `condition`, `delay`, `notify`, `ai`, `approval`,
+`order_action`). A run starts from a webhook or the manual API, executes **durably** on a background worker,
+pauses for **human approval**, validates **AI output against a JSON schema**, survives a **killed worker**
+without duplicating side effects, and records a **full trace** of every step.
 
-The capstone is language agnostic. You may implement it in Node.js, Java, Python, Go, Ruby, or any stack you are comfortable with, as long as you satisfy the API, durability, and verification requirements.
+Pure Python 3.9+ standard library: **nothing to `pip install`** (an optional `jsonschema` package is used if present).
 
-## Contents
+## Quick start
 
-- `RELAY_PROBLEM_STATEMENT.md` - capstone problem statement.
-- `docs/IMPLEMENTATION_GUIDE.md` - suggested build order, demo scenarios, and FAQ.
-- `docs/API_CONTRACT.md` - language-agnostic API contract, the fixed routes the smoke test drives, and error shapes.
-- `docs/DATA_MODEL.md` - suggested entities, relationships, and the correctness guarantees (idempotency, crash windows).
-- `docs/EVALUATION_GUIDE.md` - how your engine is verified: smoke test, kill-and-resume drill, NL eval, failure drills.
-- `data/node_catalog.json` - the node and trigger type registry; the boundary for publish validation (and the Good To Have compiler).
-- `data/seed_workflows.json` - four seed workflows: AI triage, expense approval, slow fulfillment (kill-and-resume), and a runaway poll loop (caps).
-- `data/sample_payloads.jsonl` - annotated trigger payloads, including two prompt-injection cases.
-- `data/nl_eval.jsonl` - 15 labeled cases for the Good To Have NL compiler (12 buildable, 3 traps the catalog cannot express).
-- `scripts/mock_world.py` - zero-dependency mock external world: email, chat, orders, refunds, shipments, an idempotency-aware call ledger, and live failure injection.
-- `scripts/duplication_check.py` - reads the world's ledger and verifies exactly-once side effects after a crash drill.
-- `scripts/smoke_test.py` - checks your platform against the required API contract and run lifecycle.
-- `scripts/mock_provider.py` - zero-dependency OpenAI-compatible mock LLM (shared with the Prism pack) for engine tests.
-- `scripts/validate_pack.py` - validates that the package data is parseable and internally consistent.
-
-## Optional Local Utilities
-
-All scripts use only Python standard library modules (Python 3.9+). From this folder:
+Open three terminals in the repo root (`relay-capstone/`).
 
 ```bash
-python3 scripts/validate_pack.py
+# 1) the mock world (provided in this repo)
+python scripts/mock_world.py --port 9210        # see `--help` if your copy uses different flags
+
+# 2) the API + console  (seeds the 4 demo workflows as Published)
+python -m relay.server --port 8080
+
+# 3) the worker (separate process on purpose: it is the thing you kill in the demo)
+python -m relay.worker
 ```
 
-Start the mock world:
+Open the console at **http://localhost:8080/console** (token `demo-token`).
+Shortcut for development: `python -m relay.server --with-worker` runs a worker thread inside the API process.
 
-```bash
-python3 scripts/mock_world.py --port 9210
+| Check | Command |
+|---|---|
+| Unit + integration tests (53) | `python -m unittest discover -s tests -t .` |
+| Contract smoke test | `python scripts/smoke_test.py --url http://localhost:8080 --token demo-token` |
+| Kill-and-resume drill | start API + mock world, **no worker**, then `PYTHON=python bash scripts/kill_resume_drill.sh` (Git Bash on Windows) |
+| Duplication check | `python scripts/duplication_check.py` (provided in the repo; reads the mock world's ledger) |
+
+Configuration (environment variables): `RELAY_DB` (default `relay.db`), `MOCK_WORLD_URL` (default
+`http://localhost:9210`), `RELAY_DEMO_TOKEN` (default `demo-token`, empty disables auth),
+`RELAY_LEASE_SECONDS` (default 10), `RELAY_HTTP_TIMEOUT`, `RELAY_AI_TIMEOUT`,
+`RELAY_PROVIDER` = `heuristic` (default, offline) | `anthropic` (`ANTHROPIC_API_KEY`) | `openai-compatible`
+(`openai`, `OPENAI_API_KEY`, optional `RELAY_OPENAI_BASE_URL`), and `RELAY_MODEL`.
+
+## Architecture
+
+```
+ external caller --POST /hooks/{id} (X-Relay-Secret)--+
+ builder/operator/approver --REST + console-----------+--> API process (relay/server.py -> service.py)
+                                                      |            |  one transaction: run row + snapshot + queue job
+                                                      v            v
+                                              SQLite (WAL): workflows, runs (+definition_snapshot), steps,
+                                              approvals, queue_jobs          <-- the only shared state
+                                                      ^
+                       worker process(es) (relay/worker.py) claim jobs with a lease + heartbeat
+                                                      |
+                                       engine.py: loop { cap check -> gate check -> execute node -> persist step }
+                                                      |
+                                nodes.py ---> mock world (HTTP, timeout, retries, Idempotency-Key)
+                                      \-----> AI provider adapter (providers.py, timeout, mockable)
 ```
 
-Poke at it — this is what your notify and action nodes will call:
+| Module | Responsibility |
+|---|---|
+| `service.py` | create/publish/trigger/cancel/approve; every multi-row change is one transaction |
+| `validation.py` | publish-time checks against `data/node_catalog.json` (distinct error code per failure) |
+| `jobqueue.py` / `worker.py` | durable queue on SQLite; claim = lease; heartbeat thread renews; expired lease = job is claimable again |
+| `engine.py` | the state machine, step cap, approval gate, persist-then-advance, resume |
+| `nodes.py` | node executors, retries with backoff, idempotency keys, AI retry-with-error |
+| `providers.py` | AI adapter: `FakeProvider` (tests), `HeuristicProvider` (offline demo), Anthropic, OpenAI-compatible |
+| `templates.py`, `schema.py` | `{{ }}` resolution; JSON Schema enforcement |
 
-```bash
-# a side effect with an idempotency key
-curl -s -X POST http://localhost:9210/email/send \
-  -H "Idempotency-Key: demo-1" -H "Content-Type: application/json" \
-  -d '{"to": "maya@example.com", "subject": "hi", "message": "hello"}'
+## Run state machine
 
-# send it again with the same key - replayed, not repeated
-curl -si -X POST http://localhost:9210/email/send \
-  -H "Idempotency-Key: demo-1" -H "Content-Type: application/json" \
-  -d '{"to": "maya@example.com", "subject": "hi", "message": "hello"}' | grep -i replayed
-
-# the ledger records both calls, one executed, one replayed
-curl -s http://localhost:9210/admin/ledger
-
-# business rules bite: refunds above the order total are rejected
-curl -s -X POST http://localhost:9210/orders/ord_2001/refund -d '{"amount_usd": 5000}'
+```
+                       cancel                                  
+   queued ------------------------------------------+
+     |  worker claims job                            v
+     v                                           cancelled <--- reject approval
+   running --- last node done --------------------> succeeded           ^
+     |  \--- node failed / step cap / gate refused -> failed            |
+     |   \--- cancel requested (checked between steps)--> cancelled     |
+     \--- approval node --> waiting_approval --- approve --> queued ----+(re-enqueued, atomically)
 ```
 
-Inject failures live to test your retries and timeouts:
+Statuses: `queued`, `running`, `waiting_approval`, `succeeded`, `failed`, `cancelled`.
+A paused run holds no worker and no queue job; approving re-enqueues it in the same transaction as the decision.
 
-```bash
-curl -s -X POST http://localhost:9210/admin/config -d '{"mode": "down"}'        # everything 503
-curl -s -X POST http://localhost:9210/admin/config -d '{"fail_rate": 0.3}'      # 30% errors
-curl -s -X POST http://localhost:9210/admin/config -d '{"latency_ms": 3000}'    # slow world
-curl -s -X POST http://localhost:9210/admin/config -d '{"mode": "ok", "fail_rate": 0, "latency_ms": 0}'
-```
+## Exactly-once recovery (the core design)
 
-Verify your platform once it is running (API, worker, and mock world up):
+1. **Persist, then advance.** A finished step (row + `runs.current_node_id` + counters) is committed in **one
+   transaction**. After a crash, `runs.current_node_id` says what runs next and the `steps` rows rebuild the
+   template context. Nothing lives only in memory.
+2. **Leases.** A worker claims a job with `leased_until = now + 10s` and renews it from a heartbeat thread.
+   `kill -9` stops the heartbeat; after the lease expires any worker re-claims the job. Every persist checks the
+   worker still holds the lease, so a zombie worker cannot write after losing it.
+3. **The crash window.** If the process dies after a side effect was sent but before its step was saved, we
+   cannot know whether it landed. So the node simply runs again and sends the **same `Idempotency-Key`**
+   (`{run_id}:{node_id}`; a repeat visit to the same node in a loop gets `...:{n}`, derived from persisted steps).
+   If the first call landed, the mock world absorbs the replay; if not, it executes. Either way: once.
+   The attempt number is deliberately **not** in the key, so timeout retries and crash resumes share it.
+4. **Delays survive restarts.** `delay` stores its wake-up time on the run, so a restarted worker waits only the
+   remaining time.
+5. **Poison runs.** A job delivered more than 5 times without finishing is failed (`crash loop`), not retried forever.
 
-```bash
-python3 scripts/smoke_test.py --url http://localhost:8080 --token <demo-token>
-python3 scripts/duplication_check.py --url http://localhost:9210     # after the kill-and-resume drill
-```
+Proven by `tests/test_idempotency.py` (simulated crash inside the window, timeout-after-effect) and the live
+`kill -9` drill in `VERIFICATION.md`.
 
-## Language-Agnostic Expectations
+## Guardrails (enforced in the engine, not the prompt)
 
-Your implementation should provide:
+* **Approval gate:** before executing any node whose catalog entry has `requires_approval: true`, the engine
+  queries the `approvals` table for an `approved` row on this run. Only the approve API writes such rows; model
+  output cannot. No approval → the step fails with `approval_required` and nothing is sent.
+* **Step cap:** before **every** node execution, `steps_executed >= limits.max_steps` fails the run with
+  `max_steps_exceeded` ("Run exceeded limits.max_steps (12) ..."). Loops count each visit.
+* **AI output:** validated against the node's `output_schema` (`additionalProperties: false` in the seeds). On
+  failure: ONE retry with the validation error appended, then the step fails. A model that obeys an injected
+  instruction and adds fields like `approved: true` is rejected by the schema.
+* **Prompt injection:** the system prompt tells the model the customer text is data; routing uses only
+  schema-validated enum values; the refund still needs a human. `order_id` is checked against `[A-Za-z0-9_-]+`
+  so untrusted text cannot rewrite a URL path.
+* **Timeouts:** every mock-world and model call has a timeout; timeouts/5xx/429 are retried (3 attempts,
+  exponential backoff), 4xx fail fast. A hung dependency fails the step, never the engine.
 
-- Workflow CRUD with draft → publish, catalog-based validation, and per-run definition snapshots, matching the definition shape in `data/seed_workflows.json`.
-- Webhook (secret-guarded) and manual triggers. (Cron schedules are Good To Have.)
-- Durable asynchronous execution: queue + worker loop (in-process or separate), per-step persistence, crash resume, idempotency keys on side effects.
-- `ai` nodes with JSON-schema-enforced output and per-step token accounting.
-- `approval` nodes that pause runs, and engine-enforced gating of sensitive nodes.
-- A max-steps run cap. (Wall-clock timeouts and token budgets are Good To Have.)
-- Full run traces and a lightweight console (workflows, runs, trace view, approvals).
-- A model-provider adapter that can be faked in tests.
-- (Good To Have) A natural-language compiler that emits valid drafts or refuses, with a one-command eval over `data/nl_eval.jsonl`.
+## API
 
-The console can be vibe-coded or AI-assisted. It does not need to be visually complex, but it should let you demonstrate a run trace, a pending approval, and the decision buttons.
+All platform routes need `Authorization: Bearer demo-token`. Errors look like
+`{"error": {"message": "...", "code": "invalid_node_type"}}`.
 
-## Recommended Reading Order
+| Method & path | Purpose | Notes |
+|---|---|---|
+| `GET /workflows` | list (`id`, `name`, `status`, `trigger_type`) | |
+| `POST /workflows` | create a **draft** from a definition | 201; 409 duplicate id; 422 malformed |
+| `GET /workflows/{id}` | one workflow incl. `definition` | |
+| `PUT /workflows/{id}` | update a draft | 409 once published (frozen) |
+| `POST /workflows/{id}/publish` | validate + publish | 422 with a distinct `code` per failure |
+| `POST /workflows/{id}/trigger` | body `{"input": {...}}` | 202 `{"run_id": ...}`; 409 if draft |
+| `POST /hooks/{id}` | webhook; `X-Relay-Secret` header | 401 wrong/missing secret; body becomes `{{trigger.body}}` |
+| `GET /runs`, `GET /runs/{id}` | run + full trace (`steps[]`) | resolved input, output, attempt, duration, tokens, idempotency key |
+| `POST /runs/{id}/cancel` | cancel | queued/waiting: immediate; running: between steps; terminal: 409 |
+| `GET /approvals?status=pending` | list approvals | |
+| `POST /approvals/{id}/approve` · `/reject` | decide (optional `{"decided_by": ...}`) | 409 if already decided; reject ends the run `cancelled` |
+| `GET /console` | web console | workflows, runs + traces, approvals |
 
-1. Read `RELAY_PROBLEM_STATEMENT.md`.
-2. Follow `docs/IMPLEMENTATION_GUIDE.md` for the build path.
-3. Use `docs/API_CONTRACT.md` and `docs/DATA_MODEL.md` while designing your implementation.
-4. Use `docs/EVALUATION_GUIDE.md` before running the verification scripts and writing your report.
+Publish validation error codes: `invalid_definition`, `invalid_trigger`, `invalid_node_type`, `missing_param`,
+`invalid_param_value`, `missing_branch`, `invalid_reference`, `invalid_entry`, `invalid_template_reference`.
+Backward jumps (loops) are legal; the step cap bounds them at run time.
 
-## Correctness Notes
+## Design decisions
 
-The pack is designed to expose the classic orchestrator failure modes: engines that re-run completed side effects after a crash, side effects sent without idempotency keys, approval gates enforced only in the prompt, AI output trusted without schema validation, and loops with no cap — plus, for compiler builders, compilers that invent node types. The ledger, the injection payloads, the runaway workflow, and the trap eval cases exist so you can prove your implementation does not have them.
+* **SQLite is the database and the queue.** One file, no broker to install, transactions give atomic
+  "run + job" creation and atomic "decision + re-enqueue". `BEGIN IMMEDIATE` serializes writers across processes.
+* **Standard library only.** Nothing to install, so setup cannot fail; `server.py` is a thin adapter over
+  `service.py`, so moving to FastAPI is mechanical.
+* **Approval as data.** The gate is a query over rows only the approval API can write.
+* **Snapshots, not versions.** A run stores a copy of the definition it started with; editing or republishing
+  never changes in-flight or historical runs (`tests/test_lifecycle.py`).
+* **Trace stores the resolved AI prompt.** Useful for debugging; it includes customer text, so in production
+  you would add a retention policy or redact it. Token counts and validated output are always stored.
+
+## Known limitations
+
+* Not implemented (Good To Have): cron schedule triggers, `timeout_seconds` and `max_ai_tokens` enforcement,
+  the natural-language compiler, role separation (one demo token for all personas).
+* `PUT` edits drafts only; to change a published workflow, publish a new id.
+* The approval gate accepts *any* approved approval earlier in the same run, not one tied to a specific node.
+* HTTP timeouts are per socket operation (urllib), not a hard wall-clock cap on a slow trickling response.
+* The Anthropic/OpenAI providers are written against the documented APIs but were not exercised in the
+  development sandbox (no network there); the offline `heuristic` provider and `FakeProvider` were.
+* The request bodies sent to the mock world (`/email/send`, `/chat/message`, `/orders/{id}/refund`,
+  `/shipments`) follow the node catalog; if your mock world expects different field names, adjust
+  `run_notify` / `run_order_action` in `relay/nodes.py` (one function each).
+
+## Demo script (for the explainer video)
+
+1. Console -> Workflows: run `wf_expense_approval` with amount 250 -> run pauses `waiting_approval` -> Approvals tab -> Approve -> succeeds. Run it with amount 40 -> auto-approves.
+2. Webhook with `curl` and a wrong secret -> 401; with the right secret -> run id.
+3. `wf_support_triage` via webhook with an injection message (`data/sample_payloads.jsonl`) -> AI step shows `attempt 2` (schema rejected the tainted answer), run waits for approval, **zero** side effects until Approve.
+4. `bash scripts/kill_resume_drill.sh` -> `kill -9` mid-delay -> resume -> ledger shows each effect once.
+5. `wf_runaway` -> fails at `max_steps (12)`.

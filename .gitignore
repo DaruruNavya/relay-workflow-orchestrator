@@ -1,5 +1,6 @@
+relay.db
+relay.db-wal
+relay.db-shm
 __pycache__/
-.DS_Store
-*.sqlite
-*.sqlite3
-*.db
+*.pyc
+.venv/
