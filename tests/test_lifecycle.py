@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from relay.errors import RelayError
@@ -45,6 +46,20 @@ class Lifecycle(RelayTestCase):
         run_id = self.relay.webhook(wid, "s3cret", {"a": 1})["run_id"]
         self.assertEqual(self.relay.get_run(run_id)["input"], {"a": 1})
         self.assertEqual(self.relay.get_run(run_id)["trigger_type"], "webhook")
+
+    def test_webhook_secret_is_never_returned_by_the_api(self):
+        self.deploy(workflow("hook2", [notify("n1")], trigger={"type": "webhook", "secret": "s3cret-value"}))
+        self.assertNotIn("s3cret-value", json.dumps(self.relay.get_workflow("hook2")))
+        self.assertNotIn("s3cret-value", json.dumps(self.relay.list_workflows()))
+        run_id = self.relay.webhook("hook2", "s3cret-value", {})["run_id"]
+        self.drain()
+        self.assertNotIn("s3cret-value", json.dumps(self.relay.get_run(run_id)))
+
+    def test_world_outage_shorter_than_the_retry_window_is_survived(self):
+        self.world.fail_next = 5  # five 503s in a row, then the world "comes back"
+        run = self.run_workflow(workflow("outage", [notify("n1")]))
+        self.assertEqual((run["status"], run["steps"][0]["attempt"]), ("succeeded", 6))
+        self.assertEqual(len(self.ledger()), 1)
 
     def test_approve_twice_is_a_409_and_unknown_ids_are_404(self):
         wid = self.deploy(GATED)

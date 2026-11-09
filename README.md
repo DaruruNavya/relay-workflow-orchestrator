@@ -115,8 +115,10 @@ Proven by `tests/test_idempotency.py` (simulated crash inside the window, timeou
 * **Prompt injection:** the system prompt tells the model the customer text is data; routing uses only
   schema-validated enum values; the refund still needs a human. `order_id` is checked against `[A-Za-z0-9_-]+`
   so untrusted text cannot rewrite a URL path.
-* **Timeouts:** every mock-world and model call has a timeout; timeouts/5xx/429 are retried (3 attempts,
-  exponential backoff), 4xx fail fast. A hung dependency fails the step, never the engine.
+* **Secret hygiene:** webhook secrets are redacted from `GET /workflows/{id}` and never appear in traces or errors.
+* **Timeouts:** every mock-world and model call has a timeout; timeouts/5xx/429 are retried (6 attempts, backoff
+  0.5 s doubling to an 8 s cap, so an outage of roughly 15 s is survived and the run completes once the dependency
+  returns), 4xx fail fast. A hung dependency fails the step, never the engine.
 
 ## API
 
@@ -156,6 +158,10 @@ Backward jumps (loops) are legal; the step cap bounds them at run time.
 
 ## Known limitations
 
+* The trace records the final attempt count and total tokens for an `ai` step (e.g. `attempt 2`), not the raw text of
+  each failed attempt.
+* An `ai` summary is untrusted customer text; `wf_support_triage` posts it to the configured `#support` channel only.
+  It cannot change who is notified, but it can repeat hostile text there (worth a content filter in production).
 * Not implemented (Good To Have): cron schedule triggers, `timeout_seconds` and `max_ai_tokens` enforcement,
   the natural-language compiler, role separation (one demo token for all personas).
 * `PUT` edits drafts only; to change a published workflow, publish a new id.

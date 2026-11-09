@@ -178,7 +178,10 @@ class Relay:
         defn = loads(row["definition"])
         out["trigger_type"] = (defn.get("trigger") or {}).get("type")
         if with_definition:
-            out["definition"] = defn
+            safe = json.loads(json.dumps(defn))
+            if isinstance(safe.get("trigger"), dict) and "secret" in safe["trigger"]:
+                safe["trigger"]["secret"] = "********"  # secret hygiene: never echo webhook secrets
+            out["definition"] = safe
         return out
 
     @staticmethod

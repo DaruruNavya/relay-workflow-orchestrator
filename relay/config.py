@@ -19,8 +19,9 @@ class Settings:
     poll_interval: float = 0.3
     http_timeout: float = 10.0                     # every mock-world call
     ai_timeout: float = 30.0                       # every model-provider call
-    max_attempts: int = 3                          # per step, for transient failures
+    max_attempts: int = 6                          # per step, for transient failures (~15 s of outage tolerated)
     backoff_base: float = 0.5                      # seconds; doubles each retry
+    backoff_max: float = 8.0                       # cap on a single wait
     default_max_steps: int = 100                   # used when a definition has no limits.max_steps
     max_job_deliveries: int = 5                    # a run that crashes workers this often is failed
     provider: str = "heuristic"                    # heuristic | anthropic | openai

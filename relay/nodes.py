@@ -85,7 +85,7 @@ def _call_with_retries(env: ExecEnv, fn, resolved_input, what: str):
         if attempts >= s.max_attempts:
             raise StepFailure("dependency_unavailable", f"{what} failed after {attempts} attempts: {reason}",
                               resolved_input, attempts)
-        env.sleep(s.backoff_base * (2 ** (attempts - 1)))
+        env.sleep(min(s.backoff_max, s.backoff_base * (2 ** (attempts - 1))))
 
 
 def _world_post(env: ExecEnv, path: str, body: dict, resolved_input: dict, what: str):
@@ -216,7 +216,7 @@ def _provider_call(env, system, prompt, resolved, calls_so_far, tokens):
         except ProviderError as e:
             if not e.transient or used >= s.max_attempts:
                 raise StepFailure("provider_error", f"model provider failed: {e}", resolved, calls_so_far + used, tokens)
-            env.sleep(s.backoff_base * (2 ** (used - 1)))
+            env.sleep(min(s.backoff_max, s.backoff_base * (2 ** (used - 1))))
 
 
 def _parse_and_validate(text: str, out_schema: dict):
