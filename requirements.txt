@@ -1,0 +1,3 @@
+# Relay needs only the Python 3.9+ standard library.
+# Optional: richer JSON Schema support (a built-in validator is used if this is not installed)
+# jsonschema>=4
